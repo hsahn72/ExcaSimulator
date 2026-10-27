@@ -14,6 +14,7 @@ public class ExcaSimulator : ModuleRules
 			"InputCore",
 			"EnhancedInput",
 			"HeadMountedDisplay",
+			"XRBase",
 			"ProceduralMeshComponent"
 		});
 	}
