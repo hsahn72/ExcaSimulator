@@ -10,6 +10,7 @@
 #include "InputCoreTypes.h"
 #include "InputMappingContext.h"
 #include "InputModifiers.h"
+#include "KinematicExcavatorPhysics.h"
 #include "SoilClump.h"
 #include "Camera/CameraComponent.h"
 #include "Components/BoxComponent.h"
@@ -24,7 +25,7 @@
 namespace
 {
 	constexpr float GroundOffset = 45.f;     // Undercarriage half height.
-	constexpr float TrackGauge = 220.f;
+	constexpr float TrackGauge = 220.f;      // Also passed to the physics model.
 	constexpr float TrackHalfLength = 200.f;
 	constexpr float BoomLength = 570.f;
 	constexpr float ArmLength = 290.f;
@@ -39,6 +40,10 @@ namespace
 AExcavatorPawn::AExcavatorPawn()
 {
 	PrimaryActorTick.bCanEverTick = true;
+
+	TUniquePtr<FKinematicExcavatorPhysics> KinematicModel = MakeUnique<FKinematicExcavatorPhysics>();
+	Kinematic = KinematicModel.Get();
+	Physics = MoveTemp(KinematicModel);
 
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> CubeFinder(ExcaAssets::CubePath);
 	static ConstructorHelpers::FObjectFinder<UMaterialInterface> MaterialFinder(ExcaAssets::BaseMaterialPath);
@@ -140,7 +145,35 @@ void AExcavatorPawn::BeginPlay()
 	{
 		Parts[i]->SetMaterial(0, ExcaAssets::MakeColor(BaseMaterial, this, PartColors[i]));
 	}
-	UpdateJoints(0.f, 0.f, 0.f, 0.f, 0.f);
+	SyncPhysicsParams();
+	Physics->Reset(InitialPose);
+	ApplyPose(InitialPose);
+	bHasPrevTip = false;
+}
+
+FExcavatorPhysicsState AExcavatorPawn::GetPhysicsState() const
+{
+	return Physics ? Physics->GetState() : FExcavatorPhysicsState();
+}
+
+void AExcavatorPawn::SyncPhysicsParams()
+{
+	if (!Kinematic)
+	{
+		return;
+	}
+	FKinematicExcavatorParams& P = Kinematic->Params;
+	P.SwingSpeed = SwingSpeed;
+	P.BoomSpeed = BoomSpeed;
+	P.ArmSpeed = ArmSpeed;
+	P.BucketSpeed = BucketSpeed;
+	P.TravelSpeed = TravelSpeed;
+	P.TrackGauge = TrackGauge;
+	P.HydraulicResponse = HydraulicResponse;
+	P.BoomLimits = BoomLimits;
+	P.ArmLimits = ArmLimits;
+	P.BucketLimits = BucketLimits;
+	P.StepSeconds = 1.f / FMath::Max(PhysicsStepRate, 1.f);
 }
 
 void AExcavatorPawn::CreateInputAssets()
@@ -261,17 +294,28 @@ void AExcavatorPawn::Tick(float DeltaSeconds)
 	const float RX = FMath::Clamp(ReadAxis(RightX), -1.f, 1.f);
 	const float RY = FMath::Clamp(ReadAxis(RightY), -1.f, 1.f);
 
+	FExcavatorCommand Command;
 	if (ReadAxis(TravelHold) > 0.5f)
 	{
-		UpdateJoints(DeltaSeconds, 0.f, 0.f, 0.f, 0.f);
-		UpdateTravel(DeltaSeconds, LY, RY);
+		Command.LeftTrack = LY;
+		Command.RightTrack = RY;
 	}
 	else
 	{
-		UpdateJoints(DeltaSeconds, LX, -RY, LY, RX);
-		UpdateTravel(DeltaSeconds, 0.f, 0.f);
+		Command.Swing = LX;
+		Command.Boom = -RY;
+		Command.Arm = LY;
+		Command.Bucket = RX;
 	}
 
+	// The model still holds the soil probe measured at the end of last frame.
+	SyncPhysicsParams();
+	Physics->SetCommand(Command);
+	Physics->Advance(DeltaSeconds);
+	const FExcavatorPhysicsState PhysicsState = Physics->GetState();
+
+	ApplyPose(PhysicsState.Joints);
+	UpdateTravel(DeltaSeconds, PhysicsState);
 	UpdateDigging(DeltaSeconds);
 	UpdateButtons();
 
@@ -292,38 +336,18 @@ void AExcavatorPawn::Tick(float DeltaSeconds)
 	}
 }
 
-void AExcavatorPawn::UpdateJoints(float DeltaSeconds, float SwingCmd, float BoomCmd, float ArmCmd, float BucketCmd)
+void AExcavatorPawn::ApplyPose(const FExcavatorJointState& Joints)
 {
-	// Rates ease toward the command, which reads like hydraulic lag.
-	auto Drive = [DeltaSeconds, this](float& Angle, float& Rate, float Cmd, float Speed, const FVector2D& Limits, bool bLimited)
-	{
-		Rate = FMath::FInterpTo(Rate, Cmd * Speed, DeltaSeconds, HydraulicResponse);
-		Angle += Rate * DeltaSeconds;
-		if (bLimited && (Angle < Limits.X || Angle > Limits.Y))
-		{
-			Angle = FMath::Clamp(Angle, static_cast<float>(Limits.X), static_cast<float>(Limits.Y));
-			Rate = 0.f;
-		}
-	};
-	Drive(SwingAngle, SwingRate, SwingCmd, SwingSpeed, FVector2D::ZeroVector, false);
-	Drive(BoomAngle, BoomRate, BoomCmd, BoomSpeed, BoomLimits, true);
-	Drive(ArmAngle, ArmRate, ArmCmd, ArmSpeed, ArmLimits, true);
-	Drive(BucketAngle, BucketRate, BucketCmd, BucketSpeed, BucketLimits, true);
-	SwingAngle = FRotator::NormalizeAxis(SwingAngle);
-
-	SwingPivot->SetRelativeRotation(FRotator(0.f, SwingAngle, 0.f));
-	BoomPivot->SetRelativeRotation(FRotator(BoomAngle, 0.f, 0.f));
-	ArmPivot->SetRelativeRotation(FRotator(ArmAngle, 0.f, 0.f));
-	BucketPivot->SetRelativeRotation(FRotator(BucketAngle, 0.f, 0.f));
+	SwingPivot->SetRelativeRotation(FRotator(0.f, Joints.SwingDeg, 0.f));
+	BoomPivot->SetRelativeRotation(FRotator(Joints.BoomDeg, 0.f, 0.f));
+	ArmPivot->SetRelativeRotation(FRotator(Joints.ArmDeg, 0.f, 0.f));
+	BucketPivot->SetRelativeRotation(FRotator(Joints.BucketDeg, 0.f, 0.f));
 }
 
-void AExcavatorPawn::UpdateTravel(float DeltaSeconds, float LeftCmd, float RightCmd)
+void AExcavatorPawn::UpdateTravel(float DeltaSeconds, const FExcavatorPhysicsState& PhysicsState)
 {
-	LeftTrack = FMath::FInterpTo(LeftTrack, LeftCmd, DeltaSeconds, HydraulicResponse * 0.5f);
-	RightTrack = FMath::FInterpTo(RightTrack, RightCmd, DeltaSeconds, HydraulicResponse * 0.5f);
-
-	const float Speed = (LeftTrack + RightTrack) * 0.5f * TravelSpeed;
-	const float YawRateDeg = FMath::RadiansToDegrees((LeftTrack - RightTrack) * TravelSpeed / TrackGauge);
+	const float Speed = PhysicsState.ForwardSpeed;
+	const float YawRateDeg = PhysicsState.YawRate;
 
 	FRotator Rotation = GetActorRotation();
 	Rotation.Yaw += YawRateDeg * DeltaSeconds;
@@ -350,6 +374,7 @@ void AExcavatorPawn::UpdateDigging(float DeltaSeconds)
 	ADigTerrain* T = GetTerrain();
 	if (!T)
 	{
+		SendSoilProbe(DeltaSeconds, nullptr);
 		return;
 	}
 
@@ -389,6 +414,28 @@ void AExcavatorPawn::UpdateDigging(float DeltaSeconds)
 	const float Fill = GetBucketFill();
 	BucketSoil->SetVisibility(Fill > 0.02f);
 	BucketSoil->SetRelativeScale3D(BucketSoilScale * FMath::Pow(FMath::Clamp(Fill, 0.f, 1.f), 1.f / 3.f));
+
+	SendSoilProbe(DeltaSeconds, T);
+}
+
+void AExcavatorPawn::SendSoilProbe(float DeltaSeconds, const ADigTerrain* T)
+{
+	// Tells the physics model what the bucket is touching. The model may turn
+	// this into digging resistance; the terrain itself is only edited here.
+	FBucketSoilProbe Probe;
+	Probe.TipLocation = BucketTip->GetComponentLocation();
+	Probe.TipVelocity = bHasPrevTip && DeltaSeconds > UE_KINDA_SMALL_NUMBER
+		? (Probe.TipLocation - PrevTipLocation) / DeltaSeconds
+		: FVector::ZeroVector;
+	Probe.CutDirection = BucketPivot->GetForwardVector();
+	Probe.SoilSurfaceZ = T ? T->GetHeightAt(FVector2D(Probe.TipLocation)) : GetActorLocation().Z - GroundOffset;
+	Probe.CutDepth = FMath::Max(0.f, Probe.SoilSurfaceZ - Probe.TipLocation.Z);
+	Probe.BucketLoadCm3 = BucketLoad;
+	Probe.bInSoil = T && Probe.CutDepth > 0.f && T->IsInside(FVector2D(Probe.TipLocation));
+	Physics->SetSoilProbe(Probe);
+
+	PrevTipLocation = Probe.TipLocation;
+	bHasPrevTip = true;
 }
 
 void AExcavatorPawn::UpdateButtons()
