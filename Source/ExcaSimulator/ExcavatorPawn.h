@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Pawn.h"
+#include "ExcavatorPhysics.h"
 #include "ExcavatorPawn.generated.h"
 
 class ADigTerrain;
@@ -12,9 +13,12 @@ class UInputMappingContext;
 class UMaterialInterface;
 class UStaticMesh;
 class UStaticMeshComponent;
+class FKinematicExcavatorPhysics;
 
-// Kinematic excavator built from basic shapes. Joints are driven by the two
-// thumbsticks using the ISO control pattern:
+// Excavator built from basic shapes. The pawn handles input, VR, terrain
+// contact and visuals; joint motion comes from an IExcavatorPhysics backend
+// (see ExcavatorPhysics.h), currently the kinematic stage 1 model.
+// The joints are driven by the two thumbsticks using the ISO control pattern:
 //   Left stick  X: swing          Y: arm out (push) / in (pull)
 //   Right stick X: bucket curl (left) / dump (right)   Y: boom down (push) / up (pull)
 // Holding the left grip switches the sticks to the tracks (left Y / right Y).
@@ -61,6 +65,10 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Excavator|Limits")
 	FVector2D BucketLimits = FVector2D(-160.f, 30.f);
 
+	// Fixed internal step of the physics model, Hz.
+	UPROPERTY(EditAnywhere, Category = "Excavator|Physics", meta = (ClampMin = "30.0", ClampMax = "2000.0"))
+	float PhysicsStepRate = 240.f;
+
 	// 0.9 m^3 heaped bucket, in cm^3.
 	UPROPERTY(EditAnywhere, Category = "Excavator|Digging")
 	float BucketCapacity = 900000.f;
@@ -82,6 +90,9 @@ public:
 
 	float GetBucketFill() const { return BucketCapacity > 0.f ? BucketLoad / BucketCapacity : 0.f; }
 
+	// Latest result of the physics model (joints, travel, bucket force).
+	FExcavatorPhysicsState GetPhysicsState() const;
+
 protected:
 	virtual void BeginPlay() override;
 
@@ -89,9 +100,11 @@ private:
 	UStaticMeshComponent* AddPart(FName Name, USceneComponent* Parent, const FVector& Center, const FVector& SizeCm, const FLinearColor& Color);
 	void CreateInputAssets();
 	float ReadAxis(const UInputAction* Action) const;
-	void UpdateJoints(float DeltaSeconds, float SwingCmd, float BoomCmd, float ArmCmd, float BucketCmd);
-	void UpdateTravel(float DeltaSeconds, float LeftCmd, float RightCmd);
+	void SyncPhysicsParams();
+	void ApplyPose(const FExcavatorJointState& Joints);
+	void UpdateTravel(float DeltaSeconds, const FExcavatorPhysicsState& PhysicsState);
 	void UpdateDigging(float DeltaSeconds);
+	void SendSoilProbe(float DeltaSeconds, const ADigTerrain* T);
 	void UpdateButtons();
 	void RecenterSeat();
 	ADigTerrain* GetTerrain();
@@ -165,16 +178,11 @@ private:
 	TWeakObjectPtr<ADigTerrain> Terrain;
 	FVector BucketSoilScale = FVector::OneVector;
 
-	float SwingAngle = 0.f;
-	float BoomAngle = 20.f;
-	float ArmAngle = -110.f;
-	float BucketAngle = -70.f;
-	float SwingRate = 0.f;
-	float BoomRate = 0.f;
-	float ArmRate = 0.f;
-	float BucketRate = 0.f;
-	float LeftTrack = 0.f;
-	float RightTrack = 0.f;
+	TUniquePtr<IExcavatorPhysics> Physics;
+	FKinematicExcavatorPhysics* Kinematic = nullptr;  // Physics, when it is the kinematic model.
+	FExcavatorJointState InitialPose;
+	FVector PrevTipLocation = FVector::ZeroVector;
+	bool bHasPrevTip = false;
 
 	float BucketLoad = 0.f;
 	float PendingSpill = 0.f;
